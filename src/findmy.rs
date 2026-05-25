@@ -359,6 +359,10 @@ impl DecodedCircleJoinToken {
 pub struct WildRootKey(Vec<u8>);
 
 impl WildRootKey {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     pub fn idx(&self, idx: u64) -> [u8; 32] {
         let hk = Hkdf::<Sha256>::new(None, &self.0);
         let mut recv_send = [0u8; 32];
@@ -380,6 +384,10 @@ impl WildRootKey {
 pub struct CircleSecretKey(Vec<u8>);
 
 impl CircleSecretKey {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PushError> {
         let decoded: Vec<Data> = plist::from_bytes(ciphertext)?;
 
