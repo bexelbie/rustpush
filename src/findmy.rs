@@ -265,7 +265,7 @@ pub struct OwnerSharingCircle {
 #[derive(CloudKitRecord, Default, Debug, Serialize, Deserialize, Clone)]
 #[cloudkit_record(type = "MemberSharingCircle", encrypted, rename_all = "camelCase")]
 pub struct MemberSharingCircle {
-    owner: String,
+    pub owner: String,
     pub sharing_circle_identifier: String,
     pub acceptance_state: i64,
     pub beacon_identifier: String,
@@ -285,7 +285,7 @@ impl MemberSharingCircle {
 pub struct SharingCircleSecret {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     secret_data: Vec<u8>,
-    sharing_circle_identifier: String,
+    pub sharing_circle_identifier: String,
     pub secret_type: String,
 }
 
