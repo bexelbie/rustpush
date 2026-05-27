@@ -1,3 +1,5 @@
+// ABOUTME: Implements Find My CloudKit record parsing, sharing, and location lookup.
+// ABOUTME: Provides shared beacon helpers used by headless export tools.
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
 
 use aes::{cipher::consts::U16, Aes128, Aes256};
@@ -52,6 +54,13 @@ pub struct BeaconAttributes {
     pub emoji: String,
     pub system_version: String,
     pub serial_number: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedBeaconDetails {
+    pub start_date: u64,
+    pub attributes: BeaconAttributes,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -391,9 +400,23 @@ impl CircleSecretKey {
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, PushError> {
         let decoded: Vec<Data> = plist::from_bytes(ciphertext)?;
 
-        let mut cipher = Aes256Gcm::new_from_slice(&self.0).unwrap();
-        let mut data = decoded[2].as_ref().to_vec();
-        cipher.decrypt_in_place_detached(Nonce::from_slice(decoded[0].as_ref()), &[], &mut data, Tag::from_slice(decoded[1].as_ref())).unwrap();
+        let [nonce, tag, encrypted] = decoded.as_slice() else {
+            return Err(PushError::AESGCMError);
+        };
+        if nonce.as_ref().len() != 12 || tag.as_ref().len() != 16 {
+            return Err(PushError::AESGCMError);
+        }
+
+        let mut cipher = Aes256Gcm::new_from_slice(&self.0).map_err(|_| PushError::AESGCMError)?;
+        let mut data = encrypted.as_ref().to_vec();
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(nonce.as_ref()),
+                &[],
+                &mut data,
+                Tag::from_slice(tag.as_ref()),
+            )
+            .map_err(|_| PushError::AESGCMError)?;
 
         Ok(data)
     }
@@ -520,6 +543,152 @@ struct KeyPackage {
     r#type: String,
     alignment: KeyPackageAlignment,
     range_end: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ReturnedShare {
+    key_packages: Vec<KeyPackage>,
+}
+
+fn shared_beacon_details_from_packages(
+    key_packages: &[KeyPackage],
+    shared_secret: &CircleSecretKey,
+) -> Result<Option<SharedBeaconDetails>, PushError> {
+    let Some(primary) = key_packages.iter().find(|k| k.r#type == "primaryAddress") else {
+        return Ok(None);
+    };
+    let Some(attributes) = key_packages.iter().find(|k| k.r#type == "beaconAttributes") else {
+        return Ok(None);
+    };
+    let Some(attribute_key) = attributes.keys.first() else {
+        return Ok(None);
+    };
+
+    let beacon_attrs: BeaconAttributes = plist::from_bytes(&attribute_key.decrypt(shared_secret)?)?;
+    Ok(Some(SharedBeaconDetails {
+        start_date: primary.alignment.base_date.get_ms_since_epoch(),
+        attributes: beacon_attrs,
+    }))
+}
+
+async fn send_searchparty_request<P: AnisetteProvider, T: DeserializeOwned + Default>(
+    anisette: &ArcAnisetteClient<P>,
+    token_provider: &Arc<TokenProvider<P>>,
+    config: &dyn OSConfig,
+    dsid: &str,
+    url: &str,
+    body: &impl Serialize,
+    sign_key: Option<CompactECKey<Private>>,
+) -> Result<T, PushError> {
+    let mut request = anisette.lock().await.get_headers().await?.clone();
+    request.remove("X-Mme-Client-Info").unwrap();
+    let mut anisette_headers: HeaderMap = request
+        .into_iter()
+        .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))
+        .collect();
+
+    let body = serde_json::to_string(&body)?;
+
+    if let Some(sign_key) = sign_key {
+        let mut my_signer = Signer::new(MessageDigest::sha256(), sign_key.get_pkey().as_ref())?;
+        let data = my_signer.sign_oneshot_to_vec(body.as_bytes())?;
+        anisette_headers.append(
+            "x-apple-share-auth",
+            HeaderValue::from_str(&base64_encode(&data)).unwrap(),
+        );
+    }
+
+    let token = token_provider.get_mme_token("searchPartyToken").await?;
+
+    let description = REQWEST.post(url)
+        .basic_auth(&format!("{}", dsid), Some(token))
+        .headers(anisette_headers)
+        .header(
+            "X-MMe-Client-Info",
+            config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"),
+        )
+        .header("x-apple-setup-proxy-request", "true")
+        .header("accept-version", "4")
+        .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
+        .header("x-apple-i-device-type", "1")
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send().await?
+        .bytes().await?;
+
+    if description.is_empty() {
+        return Ok(Default::default())
+    }
+
+    Ok(serde_json::from_slice(&description)?)
+}
+
+async fn query_shared_beacon_packages<P: AnisetteProvider>(
+    anisette: &ArcAnisetteClient<P>,
+    token_provider: &Arc<TokenProvider<P>>,
+    config: &dyn OSConfig,
+    dsid: &str,
+    circle: &MemberSharingCircle,
+    join_key: &DecodedCircleJoinToken,
+) -> Result<Vec<KeyPackage>, PushError> {
+    let fetch_share: ReturnedShare = send_searchparty_request(
+        anisette,
+        token_provider,
+        config,
+        dsid,
+        "https://gateway.icloud.com/findmyservice/itemsharing/getShare",
+        &json!({
+            "timestamp": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis(),
+            "type": "item",
+            "shareId": &circle.sharing_circle_identifier,
+            "memberId": &circle.owner,
+            "packages": [
+                {
+                    "maxKeys": 300,
+                    "startIndex": 0,
+                    "metadata": false,
+                    "type": "primaryAddress"
+                },
+                {
+                    "maxKeys": 300,
+                    "startIndex": 0,
+                    "metadata": false,
+                    "type": "beaconAttributes"
+                },
+                {
+                    "maxKeys": 300,
+                    "startIndex": 0,
+                    "metadata": false,
+                    "type": "circleWildRootKey"
+                },
+                {
+                    "maxKeys": 300,
+                    "startIndex": 0,
+                    "metadata": false,
+                    "type": "nearOwnerKey"
+                },
+            ]
+        }),
+        Some(join_key.key()),
+    )
+    .await?;
+
+    Ok(fetch_share.key_packages)
+}
+
+pub async fn fetch_shared_beacon_details<P: AnisetteProvider>(
+    anisette: ArcAnisetteClient<P>,
+    token_provider: Arc<TokenProvider<P>>,
+    config: Arc<dyn OSConfig>,
+    dsid: &str,
+    circle: &MemberSharingCircle,
+    join_key: &DecodedCircleJoinToken,
+    shared_secret: &CircleSecretKey,
+) -> Result<Option<SharedBeaconDetails>, PushError> {
+    let key_packages =
+        query_shared_beacon_packages(&anisette, &token_provider, config.as_ref(), dsid, circle, join_key).await?;
+    shared_beacon_details_from_packages(&key_packages, shared_secret)
 }
 
 #[derive(Deserialize, Debug)]
@@ -977,15 +1146,13 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 .find_map(|(_, a)| a.circle_shared_secret()) else { continue };
 
             let key_packages = self.query_share(&state.dsid, &circle, &join_key).await?;
-
-            let Some(primary) = key_packages.iter().find(|k| &k.r#type == "primaryAddress") else { continue };
-            let Some(attributes) = key_packages.iter().find(|k| &k.r#type == "beaconAttributes") else { continue };
-            
-            let beacon_attrs: BeaconAttributes = plist::from_bytes(&attributes.keys[0].decrypt(&shared_secret)?)?;
+            let Some(details) = shared_beacon_details_from_packages(&key_packages, &shared_secret)? else {
+                continue;
+            };
             
             let item = shared_beacons_client.entry(circle.beacon_identifier.clone()).or_default();
-            item.start_date = primary.alignment.base_date.get_ms_since_epoch();
-            item.attributes = beacon_attrs;
+            item.start_date = details.start_date;
+            item.attributes = details.attributes;
         }
 
         self.state.save(&state)?;
@@ -1022,46 +1189,15 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     }
 
     async fn query_share(&self, dsid: &str, circle: &MemberSharingCircle, join_key: &DecodedCircleJoinToken) -> Result<Vec<KeyPackage>, PushError> {
-        #[derive(Deserialize, Default)]
-        #[serde(rename_all = "camelCase")]
-        struct ReturnedShare {
-            key_packages: Vec<KeyPackage>,
-        }
-
-        let fetch_share: ReturnedShare = self.make_searchparty_request(dsid, "https://gateway.icloud.com/findmyservice/itemsharing/getShare", &json!({
-            "timestamp": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis(),
-            "type": "item",
-            "shareId": &circle.sharing_circle_identifier,
-            "memberId": &circle.owner,
-            "packages": [
-                {
-                    "maxKeys": 300,
-                    "startIndex": 0,
-                    "metadata": false,
-                    "type": "primaryAddress"
-                },
-                {
-                    "maxKeys": 300,
-                    "startIndex": 0,
-                    "metadata": false,
-                    "type": "beaconAttributes"
-                },
-                {
-                    "maxKeys": 300,
-                    "startIndex": 0,
-                    "metadata": false,
-                    "type": "circleWildRootKey"
-                },
-                {
-                    "maxKeys": 300,
-                    "startIndex": 0,
-                    "metadata": false,
-                    "type": "nearOwnerKey"
-                },
-            ]
-        }), Some(join_key.key())).await?;
-
-        Ok(fetch_share.key_packages)
+        query_shared_beacon_packages(
+            &self.anisette,
+            &self.token_provider,
+            self.config.as_ref(),
+            dsid,
+            circle,
+            join_key,
+        )
+        .await
     }
 
     pub async fn accept_item_share(&self, circle_id: &str) -> Result<(), PushError> {
@@ -1108,38 +1244,16 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     }
 
     pub async fn make_searchparty_request<T: DeserializeOwned + Default>(&self, dsid: &str, url: &str, body: &impl Serialize, sign_key: Option<CompactECKey<Private>>) -> Result<T, PushError> {
-        let mut request = self.anisette.lock().await.get_headers().await?.clone();
-        request.remove("X-Mme-Client-Info").unwrap();
-        let mut anisette_headers: HeaderMap = request.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
-
-        let body = serde_json::to_string(&body)?;
-
-        if let Some(sign_key) = sign_key {
-            let mut my_signer = Signer::new(MessageDigest::sha256(), sign_key.get_pkey().as_ref())?;
-            let data = my_signer.sign_oneshot_to_vec(body.as_bytes())?;
-            anisette_headers.append("x-apple-share-auth", HeaderValue::from_str(&base64_encode(&data)).unwrap());
-        }
-
-        let token = self.token_provider.get_mme_token("searchPartyToken").await?;
-
-        let description = REQWEST.post(url)
-            .basic_auth(&format!("{}", dsid), Some(token))
-            .headers(anisette_headers)
-            .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
-            .header("x-apple-setup-proxy-request", "true")
-            .header("accept-version", "4")
-            .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
-            .header("x-apple-i-device-type", "1")
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send().await?
-            .bytes().await?;
-
-        if description.is_empty() {
-            return Ok(Default::default())
-        }
-
-        Ok(serde_json::from_slice(&description)?)
+        send_searchparty_request(
+            &self.anisette,
+            &self.token_provider,
+            self.config.as_ref(),
+            dsid,
+            url,
+            body,
+            sign_key,
+        )
+        .await
     }
 
     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
