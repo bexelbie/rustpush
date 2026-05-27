@@ -57,7 +57,24 @@ expose it.
 (callers already have the key object).
 **PR target:** `thisiscam/rustpush` `findmy-export-support` branch.
 
-### 4. `chore: update apple-private-apis submodule to presencesync branch`
+### 4. `feat: expose shared beacon attribute fetch`
+
+**Problem:** `rustpush` already knows how to fetch and decrypt shared item
+`beaconAttributes` via the SearchParty `itemsharing/getShare` endpoint, but
+that logic is private to `FindMyClient` and requires the APS/IDS/state client
+stack. Headless exporters already have the CloudKit sharing records and
+secrets, but cannot reuse the existing name/emoji/serial extraction path.
+
+**Fix:** Add a public `fetch_shared_beacon_details()` helper that accepts the
+existing anisette client, token provider, OS config, sharing circle, join
+token, and circle shared secret, then returns decrypted `SharedBeaconDetails`
+with `BeaconAttributes`.
+
+**Upstream PR candidate:** Yes — focused API exposure that reuses existing
+request and decryption behavior without changing existing callers.
+**PR target:** `thisiscam/rustpush` `findmy-export-support` branch.
+
+### 5. `chore: update apple-private-apis submodule to presencesync branch`
 
 Points the submodule at our `apple-private-apis` fork which has its own
 commit stack (see `apple-private-apis/FORK.md`).
@@ -66,6 +83,6 @@ commit stack (see `apple-private-apis/FORK.md`).
 
 ## Summary
 
-All code changes (commits 1–3) are individually PR-able to
+All code changes (commits 1–4) are individually PR-able to
 `thisiscam/rustpush` on the `findmy-export-support` branch. They are
 small, focused, and don't change behavior for existing callers.
